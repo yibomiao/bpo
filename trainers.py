@@ -53,12 +53,10 @@ from bert_score import BERTScorer
 
 def gp_sample_and_kl(kernel_matrix, predict):
     mean = torch.zeros(predict.shape[0]).cuda()
-    # print(mean)
-    # print("mean.shape",mean.shape)
+
     predict_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=predict, covariance_matrix=kernel_matrix)
     multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=mean, covariance_matrix=kernel_matrix)
-    # print(multivariate_normal.device)
-    # print(predict_multivariate_normal.device)
+
     samples = multivariate_normal.sample(sample_shape=torch.Size([2]))  # 采样5个样本，可以根据需要更改数量
     kl = torch.distributions.kl.kl_divergence(predict_multivariate_normal,multivariate_normal)
     return samples, kl
@@ -117,44 +115,25 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
         for rejected_item_ in batch["rejected_response_only"]:
             list1.append(rejected_item)
             list2.append(rejected_item_)
-    # print(batch)
-    # use only chosen/reject: /prompt+ answer too long ,exceding max_len
-    # print("******************************************",batch["rejected_response_only"])
-    # print("******************************************",batch["chosen_response_only"])
-    # print(type(batch["chosen_response_only"]))
-    # print(len(list1))
-    # print(len(list2))
+
     P, R, F1 = bert_scorer.score(list1, list2, verbose=False)
-    # print(F1.shape)
     kernel_matrix[:batch_size,:batch_size] = F1[:len(F1)//4].reshape(batch_size,batch_size)
     kernel_matrix[:batch_size,batch_size:] = F1[len(F1)//4:len(F1)//2].reshape(batch_size,batch_size)
     kernel_matrix[batch_size:,:batch_size] = F1[len(F1)//2:len(F1) - len(F1)//4].reshape(batch_size,batch_size)
     kernel_matrix[batch_size:,batch_size:] = F1[len(F1) - len(F1)//4:].reshape(batch_size,batch_size)
-    # print(F1)
-    # print(kernel_matrix)
-    # print(kernel_matrix.shape)
-    # print(kernel_matrix.dtype)
-    # print(alpha)
-    # kernel_matrix_inv = kernel_matrix.inverse()
-    # print(kernel_matrix_inv)
-    # KL_div=0.5 * 
-    # P, R, F1 = bert_score.score(cands, refs,lang="en", verbose=True)
+
     batch_size = policy_chosen_logps.shape[0]
     pi_logratios = policy_chosen_logps - policy_rejected_logps
     ref_logratios = reference_chosen_logps - reference_rejected_logps
     g_pre = policy_chosen_logps - reference_chosen_logps
     g_rej = policy_rejected_logps - reference_rejected_logps
     g = torch.cat((g_pre,g_rej),dim = 0) * 0.1
-    # print(g.device)
-    # print(kernel_matrix.device) # cpu
+
     kernel_matrix.diagonal(dim1=-2, dim2=-1).add_(1e-4)
     samples, kl = gp_sample_and_kl(kernel_matrix,g)
-    # print("samples",samples)
-    # print("kl",kl)
-    # print("kl.shape",kl.shape)
+
     logits = pi_logratios - ref_logratios
-    # print(logits)
-    # exit()
+
 
     if reference_free:
         ref_logratios = 0
@@ -164,7 +143,7 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
     if ipo:
         losses = (logits - 1/(2 * beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
     else:
-        losses = -F.logsigmoid(beta * logits) * (1 - label_smoothing) - F.logsigmoid(-beta * logits) * label_smoothing 
+
         # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
         losses = -F.logsigmoid(beta * logits) * (1 - label_smoothing) - F.logsigmoid(-beta * logits) * label_smoothing
 
