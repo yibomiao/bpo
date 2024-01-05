@@ -49,18 +49,23 @@ warnings.filterwarnings("ignore")
 import bert_score
 from bert_score import BERTScorer
 
+class Additional_hps(torch.nn.Module):
+    def __init__(self,config):
+        super(Additional_hps, self).__init__()
+        self.register_parameter(name="hp1", param=torch.nn.Parameter(torch.ones(1))) 
+        self.register_parameter(name="hp2", param=torch.nn.Parameter(torch.ones(1))) 
 
 
 def gp_sample_and_kl(kernel_matrix, predict):
     mean = torch.zeros(predict.shape[0]).cuda()
-    # print(mean)
-    # print("mean.shape",mean.shape)
+
     predict_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=predict, covariance_matrix=kernel_matrix)
     multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=mean, covariance_matrix=kernel_matrix)
-    # print(multivariate_normal.device)
-    # print(predict_multivariate_normal.device)
-    samples = multivariate_normal.sample(sample_shape=torch.Size([1]))  # 采样1个样本，可以根据需要更改数量
+
+    # samples = multivariate_normal.sample(sample_shape=torch.Size([1]))  # 采样1个样本，可以根据需要更改数量
+    samples = multivariate_normal.rsample(sample_shape=torch.Size([1]))  # 采样1个样本，可以根据需要更改数量
     kl = torch.distributions.kl.kl_divergence(predict_multivariate_normal,multivariate_normal)
+    # print("kl",kl)
     return samples, kl
 
 
@@ -71,6 +76,8 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
                     reference_chosen_logps: torch.FloatTensor,
                     reference_rejected_logps: torch.FloatTensor,
                     bert_scorer,
+                    all_additional_hps,
+                    train_process,
                     beta: float,
                     alpha: float,
                     label_smoothing: float = 0.0,
@@ -118,64 +125,50 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
         for rejected_item_ in batch["rejected_response_only"]:
             list1.append(rejected_item)
             list2.append(rejected_item_)
-    # print(batch)
     # use only chosen/reject: /prompt+ answer too long ,exceding max_len
-    # print("******************************************",batch["rejected_response_only"])
-    # print("******************************************",batch["chosen_response_only"])
-    # print(type(batch["chosen_response_only"]))
-    # print(len(list1))
-    # print(len(list2))
+
     P, R, F1 = bert_scorer.score(list1, list2, verbose=False)
-    # print(F1.shape)
     kernel_matrix[:batch_size,:batch_size] = F1[:len(F1)//4].reshape(batch_size,batch_size)
     kernel_matrix[:batch_size,batch_size:] = F1[len(F1)//4:len(F1)//2].reshape(batch_size,batch_size)
     kernel_matrix[batch_size:,:batch_size] = F1[len(F1)//2:len(F1) - len(F1)//4].reshape(batch_size,batch_size)
     kernel_matrix[batch_size:,batch_size:] = F1[len(F1) - len(F1)//4:].reshape(batch_size,batch_size)
-    # print(F1)
-    # print(kernel_matrix)
-    # print(kernel_matrix.shape)
-    # print(kernel_matrix.dtype)
-    # print(alpha)
-    # kernel_matrix_inv = kernel_matrix.inverse()
-    # print(kernel_matrix_inv)
-    # KL_div=0.5 * 
-    # P, R, F1 = bert_score.score(cands, refs,lang="en", verbose=True)
+
     batch_size = policy_chosen_logps.shape[0]
     pi_logratios = policy_chosen_logps - policy_rejected_logps
     ref_logratios = reference_chosen_logps - reference_rejected_logps
     g_pre = policy_chosen_logps - reference_chosen_logps
     g_rej = policy_rejected_logps - reference_rejected_logps
+    
     g = torch.cat((g_pre,g_rej),dim = 0) * beta
-    # print(g.device)
-    # print(kernel_matrix.device) # cpu
+    kernel_matrix = kernel_matrix * torch.nn.functional.softplus(all_additional_hps.hp1) + all_additional_hps.hp2
+    print("all_additional_hps.hp1",all_additional_hps.hp1) #from cuda:0 -cuda:3 根据FSDP，最后统一更新？
+
     kernel_matrix.diagonal(dim1=-2, dim2=-1).add_(1e-6)
     samples, kl = gp_sample_and_kl(kernel_matrix,g)
-    # print("samples",samples)
-    # print("kl",kl)
-    # print("kl.shape",kl.shape)
+
     logits = pi_logratios - ref_logratios
-    # print(logits)
-    # exit()
+
 
     if reference_free:
         ref_logratios = 0
 
     logits = pi_logratios - ref_logratios  # also known as h_{\pi_\theta}^{y_w,y_l}
-    # print("logits",logits)
-    # print("logits.shape",logits.shape)
-
 
     if ipo:
         losses = (logits - 1/(2 * beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
     else:
         sample_loss = samples[0,:batch_size] - samples[0,batch_size:]
-        # print("sample_loss",sample_loss)
         # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
-        losses = -F.logsigmoid(beta * logits + sample_loss) * (1 - label_smoothing) - F.logsigmoid(-beta * logits + sample_loss) * label_smoothing - (1/batch_size)* kl
+        losses = -F.logsigmoid(beta * logits + sample_loss) * (1 - label_smoothing) - F.logsigmoid(-beta * logits + sample_loss) * label_smoothing + (1/(2*batch_size))* kl
+        # losses = -F.logsigmoid(beta * logits ) * (1 - label_smoothing) - F.logsigmoid(-beta * logits ) * label_smoothing - kl
 
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
     rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
-    return losses, chosen_rewards, rejected_rewards
+    if train_process:
+        return losses, chosen_rewards, rejected_rewards, (1/batch_size)* kl
+    else:
+        original_losses = -F.logsigmoid(beta * logits) * (1 - label_smoothing) - F.logsigmoid(-beta * logits) * label_smoothing
+        return original_losses, chosen_rewards, rejected_rewards, (1/batch_size)* kl
 
 
 def preference_loss(policy_chosen_logps: torch.FloatTensor,
@@ -295,6 +288,7 @@ class BasicTrainer(object):
         self.config = config
         self.run_dir = run_dir
         self.bert_scorer = BERTScorer(lang="en")
+        self.all_additional_hps = Additional_hps(self.config).cuda()
 
         tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
         rank0_print(f'Loading tokenizer {tokenizer_name_or_path}')
@@ -388,19 +382,27 @@ class BasicTrainer(object):
 
             # losses, chosen_rewards, rejected_rewards = preference_loss(
             #     policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, **loss_kwargs)
-            losses, chosen_rewards, rejected_rewards = bayes_preference_loss(
-                batch, policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, self.bert_scorer , **loss_kwargs)
+            if train_test == 'train':
+                losses, chosen_rewards, rejected_rewards, kl = bayes_preference_loss(
+                    batch, policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, self.bert_scorer ,self.all_additional_hps, train_process=True, **loss_kwargs)
+            else:
+                losses, chosen_rewards, rejected_rewards, kl = bayes_preference_loss(
+                    batch, policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, self.bert_scorer ,self.all_additional_hps, train_process=False, **loss_kwargs)
+
 
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
             chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
             rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
             reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
+            kl = all_gather_if_needed(kl, self.rank, self.world_size)
 
             metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/kl'] = kl.cpu().numpy().tolist()
+            # metrics[f'kl_{train_test}/kl'] = kl.cpu().numpy().tolist()
 
             policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
             metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
@@ -423,9 +425,10 @@ class BasicTrainer(object):
         """Begin either SFT or DPO training, with periodic evaluation."""
 
         rank0_print(f'Using {self.config.optimizer} optimizer')
-        self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
+        all_parameters = list(self.policy.parameters()) + [self.all_additional_hps.hp1, self.all_additional_hps.hp2] #hp1和hp2不需要存下来，因为最后只是想要policy模型
+        # print("all_parameters",all_parameters)
+        self.optimizer = getattr(torch.optim, self.config.optimizer)(all_parameters, lr=self.config.lr)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / (self.config.warmup_steps + 1)))
-    
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -513,7 +516,7 @@ class BasicTrainer(object):
                 loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
                 (loss / self.config.gradient_accumulation_steps).backward()
 
-                for k, v in metrics.items():
+                for k, v in metrics.items(): 
                     batch_metrics[k].extend(v)
 
             grad_norm = self.clip_gradient()
@@ -533,6 +536,8 @@ class BasicTrainer(object):
                 mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
                 mean_train_metrics['counters/examples'] = self.example_counter
                 mean_train_metrics['counters/updates'] = self.batch_counter
+                mean_train_metrics['hps/hp1'] = self.all_additional_hps.hp1.item()
+                mean_train_metrics['hps/hp2'] = self.all_additional_hps.hp1.item()
                 rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
 
                 if self.config.wandb.enabled and self.rank == 0:
@@ -655,19 +660,19 @@ class FSDPTrainer(BasicTrainer):
         del policy_state_dict
         dist.barrier()
 
-        save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, optim_state_dict_config=save_policy):
-            optimizer_state_dict = FSDP.optim_state_dict(self.policy, self.optimizer)
+        # save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        # with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, optim_state_dict_config=save_policy):
+        #     optimizer_state_dict = FSDP.optim_state_dict(self.policy, self.optimizer)
 
-        if self.rank == 0:
-            self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
-        del optimizer_state_dict
-        dist.barrier()
+        # if self.rank == 0:
+        #     self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
+        # del optimizer_state_dict
+        # dist.barrier()
 
-        if self.rank == 0:
-            scheduler_state_dict = self.scheduler.state_dict()
-            self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
-        dist.barrier()
+        # if self.rank == 0:
+        #     scheduler_state_dict = self.scheduler.state_dict()
+        #     self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+        # dist.barrier()
         
 
 class TensorParallelTrainer(BasicTrainer):
