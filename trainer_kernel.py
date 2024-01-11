@@ -45,22 +45,71 @@ import json
 import functools
 from typing import Optional, Dict, List, Union, Tuple
 import warnings
-warnings.filterwarnings("ignore")
+# warnings.filterwarnings("ignore")
 # import bert_score
 # from bert_score import BERTScorer
+
+def psd_safe_cholesky(A, upper=False, out=None, jitter=None):
+	"""Compute the Cholesky decomposition of A. If A is only p.s.d, add a small jitter to the diagonal.
+	Args:
+		:attr:`A` (Tensor):
+			The tensor to compute the Cholesky decomposition of
+		:attr:`upper` (bool, optional):
+			See torch.cholesky
+		:attr:`out` (Tensor, optional):
+			See torch.cholesky
+		:attr:`jitter` (float, optional):
+			The jitter to add to the diagonal of A in case A is only p.s.d. If omitted, chosen
+			as 1e-6 (float) or 1e-8 (double)
+	"""
+	try:
+		L = torch.linalg.cholesky(A, upper=upper, out=out)
+		return L
+	except RuntimeError as e:
+		isnan = torch.isnan(A)
+		if isnan.any():
+			raise ValueError(
+				f"cholesky_cpu: {isnan.sum().item()} of {A.numel()} elements of the {A.shape} tensor are NaN."
+			)
+
+		if jitter is None:
+			jitter = 1e-6 if A.dtype == torch.float32 else 1e-8
+		Aprime = A.clone()
+		jitter_prev = 0
+		for i in range(10):
+			jitter_new = jitter * (10 ** i)
+			Aprime.diagonal(dim1=-2, dim2=-1).add_(jitter_new - jitter_prev)
+			jitter_prev = jitter_new
+			try:
+				L = torch.linalg.cholesky(Aprime, upper=upper, out=out)
+				warnings.warn(
+					f"A not p.d., added jitter of {jitter_new} to the diagonal",
+					RuntimeWarning,
+				)
+				return L
+			except RuntimeError:
+				continue
+		raise e
 
 class Additional_hps(torch.nn.Module):
     def __init__(self,config):
         super(Additional_hps, self).__init__()
         self.register_parameter(name="hp1", param=torch.nn.Parameter(torch.ones(1))) 
-        self.register_parameter(name="hp2", param=torch.nn.Parameter(0.1*torch.ones(1))) 
+        # self.register_parameter(name="hp2", param=torch.nn.Parameter(torch.tensor([0.1]))) 
+        self.register_parameter(name="hp2", param=torch.nn.Parameter(torch.ones(1))) 
 
 
 def gp_sample_and_kl(kernel_matrix, predict):
     mean = torch.zeros(predict.shape[0]).cuda()
+    # print("predict",predict)
+    # print("kernel_matrix",kernel_matrix)
+    L= psd_safe_cholesky(kernel_matrix)
+    # print('L',L)
 
-    predict_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=predict, covariance_matrix=kernel_matrix)
-    multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=mean, covariance_matrix=kernel_matrix)
+    # predict_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=predict, covariance_matrix=kernel_matrix)
+    # multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=mean, covariance_matrix=kernel_matrix)
+    predict_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=predict, scale_tril=L)
+    multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=mean, scale_tril=L)
 
     # samples = multivariate_normal.sample(sample_shape=torch.Size([1]))  # 采样1个样本，可以根据需要更改数量
     samples = multivariate_normal.rsample(sample_shape=torch.Size([1]))  # 采样1个样本，可以根据需要更改数量
@@ -102,22 +151,24 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
         The losses tensor contains the DPO loss for each example in the batch.
         The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
     """
+
     batch_size = policy_chosen_logps.shape[0]
+    pi_logratios = policy_chosen_logps - policy_rejected_logps
+    ref_logratios = reference_chosen_logps - reference_rejected_logps
+
     kernel_matrix = torch.zeros(batch_size*2,batch_size*2).cuda()
-    # print(reference_chosen_hidden.shape) # torch.Size([16, 512, 2560])
-    reference_chosen_hidden_flat = reference_chosen_hidden.view(reference_chosen_hidden.shape[0], -1)
-    reference_rejected_hidden_flat = reference_rejected_hidden.view(reference_chosen_hidden.shape[0], -1)
-    reference_chosen_hidden_flat = F.normalize(reference_chosen_hidden_flat, p=2, dim=1)
-    reference_rejected_hidden_flat = F.normalize(reference_rejected_hidden_flat, p=2, dim=1)
-    # print("reference_rejected_hidden_flat",reference_rejected_hidden_flat)
 
     # 计算余弦相似度
-    similarity_1 = F.cosine_similarity(reference_chosen_hidden_flat.unsqueeze(1), reference_chosen_hidden_flat.unsqueeze(0), dim=2)
-    similarity_2 = F.cosine_similarity(reference_chosen_hidden_flat.unsqueeze(1), reference_rejected_hidden_flat.unsqueeze(0), dim=2)
-    similarity_3 = F.cosine_similarity(reference_rejected_hidden_flat.unsqueeze(1), reference_chosen_hidden_flat.unsqueeze(0), dim=2)
-    similarity_4 = F.cosine_similarity(reference_rejected_hidden_flat.unsqueeze(1), reference_rejected_hidden_flat.unsqueeze(0), dim=2)
+    similarity_1 = F.cosine_similarity(reference_chosen_hidden.unsqueeze(1), reference_chosen_hidden.unsqueeze(0), dim=2)
+    similarity_2 = F.cosine_similarity(reference_chosen_hidden.unsqueeze(1), reference_rejected_hidden.unsqueeze(0), dim=2)
+    similarity_3 = F.cosine_similarity(reference_rejected_hidden.unsqueeze(1), reference_chosen_hidden.unsqueeze(0), dim=2)
+    similarity_4 = F.cosine_similarity(reference_rejected_hidden.unsqueeze(1), reference_rejected_hidden.unsqueeze(0), dim=2)
+    # print("similarity1",similarity_1)
+    # print("similarity2",similarity_2)
+    # print("similarity3",similarity_3)
+    # print("similarity4",similarity_4)
     # print("similarity_1.shape",similarity_1.shape) #16,16
-    # print("similarity_1",similarity_1) #16,16
+    # # print("similarity_1",similarity_1) #16,16
     # exit()
 
     kernel_matrix[:batch_size,:batch_size] = similarity_1.reshape(batch_size,batch_size)
@@ -125,17 +176,23 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
     kernel_matrix[batch_size:,:batch_size] = similarity_3.reshape(batch_size,batch_size)
     kernel_matrix[batch_size:,batch_size:] = similarity_4.reshape(batch_size,batch_size)
 
-    batch_size = policy_chosen_logps.shape[0]
-    pi_logratios = policy_chosen_logps - policy_rejected_logps
-    ref_logratios = reference_chosen_logps - reference_rejected_logps
+    # batch_size = policy_chosen_logps.shape[0]
+    # identity_matrix = torch.eye(2*batch_size).cuda()
+    # kernel_matrix = kernel_matrix * (1 - identity_matrix) + identity_matrix
+
     g_pre = policy_chosen_logps - reference_chosen_logps
     g_rej = policy_rejected_logps - reference_rejected_logps
+    # print("kernel_matrix",kernel_matrix)
+    # print("g_pre",g_pre)
+    # print("g_rej",g_rej)
+
     
     g = torch.cat((g_pre,g_rej),dim = 0) * beta
+    # print("g",g)
     kernel_matrix = kernel_matrix * torch.nn.functional.softplus(all_additional_hps.hp1) + all_additional_hps.hp2
     # print("all_additional_hps.hp1",all_additional_hps.hp1) #from cuda:0 -cuda:3 根据FSDP，最后统一更新？
 
-    kernel_matrix.diagonal(dim1=-2, dim2=-1).add_(1e-6)
+    kernel_matrix.diagonal(dim1=-2, dim2=-1).add_(1e-4)
     samples, kl = gp_sample_and_kl(kernel_matrix,g)
 
     logits = pi_logratios - ref_logratios
@@ -151,7 +208,8 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
     else:
         sample_loss = samples[0,:batch_size] - samples[0,batch_size:]
         # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
-        losses = -F.logsigmoid(beta * logits + sample_loss) * (1 - label_smoothing) - F.logsigmoid(-beta * logits + sample_loss) * label_smoothing + (1/batch_size)* kl
+        # losses = -F.logsigmoid(beta * logits + sample_loss) * (1 - label_smoothing) - F.logsigmoid(-beta * logits + sample_loss) * label_smoothing + (1/8*batch_size)* kl
+        losses = -F.logsigmoid(beta * logits + sample_loss) * (1 - label_smoothing) - F.logsigmoid(-beta * logits + sample_loss) * label_smoothing
         # losses = -F.logsigmoid(beta * logits ) * (1 - label_smoothing) - F.logsigmoid(-beta * logits ) * label_smoothing - kl
 
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
@@ -340,30 +398,50 @@ class BasicTrainer(object):
         
            We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
-        # print("batch",batch)
-        # print("=" * 50)
-        concatenated_batch = concatenated_inputs(batch)
-        # print("concatenated_batch",concatenated_batch)
 
-        output = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask'], output_hidden_states=True)
-        all_logits = output.logits.to(torch.float32)   
-        # print(type(all_hidden_states)) # turple
-        # print(len(all_hidden_states)) # 33
-        # print(all_hidden_states[-1].shape) # torch.Size([32, 512, 2560])
-
-        # print("all_logits sahpe",all_logits.shape) #([32, 512, 50304]) bs,seqlen,vocubulary_size
-        all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
-        # print("all_logps shape",all_logps.shape) # batchsize
-        chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
-        # print("batch['chosen_input_ids'].shape[0]",batch['chosen_input_ids'].shape[0]) # 16 batchsize/2
-        rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
         if return_hidden:
-            all_hidden_states = output.hidden_states[-1]
-            print("all_hidden_states.shape",all_hidden_states.shape)
-            chosen_hidden = all_hidden_states[:batch['chosen_input_ids'].shape[0]]
-            rejected_hidden = all_hidden_states[:batch['rejected_input_ids'].shape[0]]
-            return chosen_logps, rejected_logps, chosen_hidden, rejected_hidden
-        return chosen_logps, rejected_logps
+            concatenated_batch = concatenated_inputs(batch)
+            # print("concatenated_batch",concatenated_batch)
+            # print(concatenated_batch['concatenated_attention_mask'])
+            # print("concatenated_batch['concatenated_attention_mask'] shape",concatenated_batch['concatenated_attention_mask'].shape)
+
+            output = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask'], output_hidden_states=True)
+            all_logits = output.logits.to(torch.float32)   
+            # print(type(all_hidden_states)) # turple
+            # print(len(all_hidden_states)) # 33
+            # print(all_hidden_states[-1].shape) # torch.Size([32, 512, 2560])
+
+            # print("all_logits sahpe",all_logits.shape) #([32, 512, 50304]) bs,seqlen,vocubulary_size
+            all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
+            # print("all_logps shape",all_logps.shape) # batchsize
+            chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
+            # print("batch['chosen_input_ids'].shape[0]",batch['chosen_input_ids'].shape[0]) # 16 batchsize/2
+            rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
+            all_hidden_states = output.hidden_states[-1].float()
+
+            with torch.no_grad():
+                weights_for_non_padding = concatenated_batch['concatenated_attention_mask'] * torch.arange(start=1, end=all_hidden_states.shape[1] + 1).cuda().unsqueeze(0)
+                sum_embeddings = torch.sum(all_hidden_states * weights_for_non_padding.unsqueeze(-1), dim=1).float()
+                # nonzero_count_per_row = torch.count_nonzero(weights_for_non_padding, dim=1).unsqueeze(-1)
+                # print("Nonzero Count Per Row:", nonzero_count_per_row)
+                num_of_none_padding_tokens = torch.sum(weights_for_non_padding, dim=-1).float().unsqueeze(-1)
+                sentence_embeddings = sum_embeddings / num_of_none_padding_tokens
+                # print("sentence_embeddings",sentence_embeddings)
+                # print("sentence_embeddings shape",sentence_embeddings.shape)
+                chosen_hidden = sentence_embeddings[:batch['chosen_input_ids'].shape[0]] #batchsize * 2560
+                rejected_hidden = sentence_embeddings[batch['rejected_input_ids'].shape[0]:]
+            return chosen_logps, rejected_logps, chosen_hidden.detach().float(), rejected_hidden.detach().float()
+        else:
+            concatenated_batch = concatenated_inputs(batch)
+            # print("concatenated_batch",concatenated_batch)
+            all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)    
+            
+            # print("all_logits sahpe",all_logits.shape) #([32, 512, 50304]) bs,seqlen,vocubulary_size
+            all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
+            # print("all_logps shape",all_logps.shape) # batchsize
+            chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
+            rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
+            return chosen_logps, rejected_logps
 
 
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
@@ -373,9 +451,7 @@ class BasicTrainer(object):
         train_test = 'train' if train else 'eval'
         if loss_config.name in {'dpo', 'ipo'}:
             policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
-            # print("policy_chosen_logps hsape",policy_chosen_logps.shape)#batchsize/2
-            # print("policy_rejected_logps hsape",policy_rejected_logps.shape) #batchsize/2
-            # print("policy_chosen_logps ",policy_chosen_logps) #batchsize/2 sum of logp
+
             with torch.no_grad():
                 reference_chosen_logps, reference_rejected_logps, reference_chosen_hidden, reference_rejected_hidden = self.concatenated_forward(self.reference_model, batch, return_hidden=True)
             if loss_config.name == 'dpo':
@@ -430,9 +506,17 @@ class BasicTrainer(object):
         """Begin either SFT or DPO training, with periodic evaluation."""
 
         rank0_print(f'Using {self.config.optimizer} optimizer')
-        all_parameters = list(self.policy.parameters()) + [self.all_additional_hps.hp1, self.all_additional_hps.hp2] #hp1和hp2不需要存下来，因为最后只是想要policy模型
+
         # print("all_parameters",all_parameters)
+        # param_groups = [
+        #     {'params': self.policy.parameters(), 'lr': self.config.lr},
+        #     {'params': [self.all_additional_hps.hp1, self.all_additional_hps.hp2], 'lr': 5e-2}
+        # ]
+        # self.optimizer = getattr(torch.optim, self.config.optimizer)(param_groups, lr=0)  # 这里的 lr=0 是一个占位符，实际的学习率由 param_groups 里指定
+
+        all_parameters = list(self.policy.parameters()) + [self.all_additional_hps.hp1, self.all_additional_hps.hp2] #hp1和hp2不需要存下来，因为最后只是想要policy模型
         self.optimizer = getattr(torch.optim, self.config.optimizer)(all_parameters, lr=self.config.lr)
+
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / (self.config.warmup_steps + 1)))
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
@@ -446,8 +530,10 @@ class BasicTrainer(object):
         last_log = None
 
         for batch in tqdm.tqdm(self.train_iterator,desc='Training process'):
+
             #### BEGIN EVALUATION ####
             if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
+                torch.cuda.empty_cache()
                 rank0_print(f'Running evaluation after {self.example_counter} train examples')
                 self.policy.eval()
 
@@ -459,6 +545,7 @@ class BasicTrainer(object):
                         reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
 
                 for eval_batch in (tqdm.tqdm(self.eval_batches, desc='Computing eval metrics') if self.rank == 0 else self.eval_batches):
+                    torch.cuda.empty_cache()
                     local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
                     with torch.no_grad():
                         _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
@@ -542,7 +629,7 @@ class BasicTrainer(object):
                 mean_train_metrics['counters/examples'] = self.example_counter
                 mean_train_metrics['counters/updates'] = self.batch_counter
                 mean_train_metrics['hps/hp1'] = self.all_additional_hps.hp1.item()
-                mean_train_metrics['hps/hp2'] = self.all_additional_hps.hp1.item()
+                mean_train_metrics['hps/hp2'] = self.all_additional_hps.hp2.item()
                 rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
 
                 if self.config.wandb.enabled and self.rank == 0:
