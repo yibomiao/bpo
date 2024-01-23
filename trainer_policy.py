@@ -108,7 +108,8 @@ def gp_sample_and_kl(policy_kernel_matrix, ref_kernel_matrix, predict):
     # L_policy= psd_safe_cholesky(policy_kernel_matrix)
     # print('L',L)
 
-    predict_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=predict, covariance_matrix=policy_kernel_matrix)
+    # predict_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=predict, covariance_matrix=policy_kernel_matrix)
+    predict_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=mean, covariance_matrix=policy_kernel_matrix)
     noise_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=mean, covariance_matrix=policy_kernel_matrix)
     multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=mean, covariance_matrix=ref_kernel_matrix)
     # predict_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=predict, scale_tril=L_policy)
@@ -116,14 +117,16 @@ def gp_sample_and_kl(policy_kernel_matrix, ref_kernel_matrix, predict):
     # noise_multivariate_normal = torch.distributions.multivariate_normal.MultivariateNormal(loc=mean, scale_tril=L_policy)
 
     # samples = multivariate_normal.sample(sample_shape=torch.Size([1]))  # 采样1个样本，可以根据需要更改数量
-    samples = noise_multivariate_normal.rsample(sample_shape=torch.Size([1]))  # 采样1个样本，可以根据需要更改数量
+    samples = noise_multivariate_normal.rsample(sample_shape=torch.Size([256]))  # 采样1个样本，可以根据需要更改数量
     kl = torch.distributions.kl.kl_divergence(predict_multivariate_normal,multivariate_normal)
     # print("kl",kl)
     return samples, kl
 
 
 #CUDA_VISIBLE_DEVICES="1,2" python -u train.py model=pythia28 datasets=[hh] loss=dpo loss.beta=0.1 exp_name=anthropic_dpo_pythia28 gradient_accumulation_steps=16 batch_size=64 eval_batch_size=16 trainer=FSDPTrainer sample_during_eval=false model.fsdp_policy_mp=bfloat16 model.archive=/liymai24/sjtu/yibo/direct-preference-optimization-main/.cache/root/anthropic_dpo_pythia28_2023-12-27_08-16-22_907411/step-39936/policy.pt debug=true
-def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
+def bayes_preference_loss(rank: int,
+                    world_size: int,
+                    batch: Dict[str, Union[List, torch.LongTensor]],
                     policy_chosen_logps: torch.FloatTensor,
                     policy_rejected_logps: torch.FloatTensor,
                     reference_chosen_logps: torch.FloatTensor,
@@ -132,6 +135,8 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
                     reference_rejected_hidden: torch.FloatTensor,
                     policy_chosen_hidden: torch.FloatTensor,
                     policy_rejected_hidden: torch.FloatTensor,
+                    all_policy_ps: torch.FloatTensor,
+                    all_reference_ps: torch.FloatTensor,
                     # bert_scorer,
                     all_additional_hps,
                     train_process,
@@ -174,12 +179,15 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
 
     g_pre = policy_chosen_logps - reference_chosen_logps
     g_rej = policy_rejected_logps - reference_rejected_logps
+
     # print("kernel_matrix",kernel_matrix)
     # print("g_pre",g_pre)
     # print("g_rej",g_rej)
-
+    kl_divergence = F.kl_div(all_policy_ps.log(), all_reference_ps, reduction='sum')
+    # print("kl_divergence shape",kl_divergence.shape)
     
     g = torch.cat((g_pre,g_rej),dim = 0) * beta
+    # l2_norm = torch.norm(g, p=2)
     # print("g",g)
     policy_kernel_matrix = policy_kernel_matrix * torch.nn.functional.softplus(all_additional_hps.hp1) + all_additional_hps.hp2
     # print("all_additional_hps.hp1",all_additional_hps.hp1) #from cuda:0 -cuda:3 根据FSDP，最后统一更新？
@@ -191,8 +199,6 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
     # print("policy_kernel_matrix",policy_kernel_matrix)
     samples, kl = gp_sample_and_kl(policy_kernel_matrix, ref_kernel_matrix,g)
 
-    logits = pi_logratios - ref_logratios
-
 
     if reference_free:
         ref_logratios = 0
@@ -202,19 +208,29 @@ def bayes_preference_loss(batch: Dict[str, Union[List, torch.LongTensor]],
     if ipo:
         losses = (logits - 1/(2 * beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
     else:
-        sample_loss = samples[0,:batch_size] - samples[0,batch_size:]
+        sample_loss = samples[:,:batch_size] - samples[:,batch_size:]
+        # print(rank)
+        # print(world_size)
+        sample_loss_all = all_gather_if_needed(sample_loss, rank, world_size)
+        # print("sample_loss shape",sample_loss.shape) # 256* batchsize
+        # print("sample_loss_all shape",sample_loss_all.shape) #(256*worldsize)* batchsize
+        # print("sample_loss shape",sample_loss.shape) #sample_loss shape torch.Size([256, 8])  
+        # print("logits shape",logits.shape) #logits shape torch.Size([8])
+        # print("F.logsigmoid(beta * logits.unsqueeze(0) + sample_loss) shape",F.logsigmoid(beta * logits.unsqueeze(0) + sample_loss).shape) #shape torch.Size([256, 8])
+        # print("F.logsigmoid(beta * logits.unsqueeze(0) + sample_loss).mean(0) shape",F.logsigmoid(beta * logits.unsqueeze(0) + sample_loss).mean(0).shape) #shape torch.Size([8])
         # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
-        # losses = -F.logsigmoid(beta * logits + sample_loss) * (1 - label_smoothing) - F.logsigmoid(-beta * logits + sample_loss) * label_smoothing + (1/8*batch_size)* kl
-        losses = -F.logsigmoid(beta * logits + sample_loss) * (1 - label_smoothing) - F.logsigmoid(-beta * logits + sample_loss) * label_smoothing
+        losses = -F.logsigmoid(beta * logits.unsqueeze(0) + sample_loss_all).mean(0) * (1 - label_smoothing) - F.logsigmoid(-beta * logits.unsqueeze(0) + sample_loss_all).mean(0) * label_smoothing + (1/8*batch_size)* kl
+        # losses = -F.logsigmoid(beta * logits + sample_loss) * (1 - label_smoothing) - F.logsigmoid(-beta * logits + sample_loss) * label_smoothing
+        # losses = -F.logsigmoid(beta * logits) * (1 - label_smoothing) - F.logsigmoid(-beta * logits ) * label_smoothing + (1/8*batch_size)* kl
         # losses = -F.logsigmoid(beta * logits ) * (1 - label_smoothing) - F.logsigmoid(-beta * logits ) * label_smoothing - kl
 
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
     rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
     if train_process:
-        return losses, chosen_rewards, rejected_rewards, (1/batch_size)* kl
+        return losses, chosen_rewards, rejected_rewards, (1/8*batch_size)* kl, kl_divergence
     else:
         original_losses = -F.logsigmoid(beta * logits) * (1 - label_smoothing) - F.logsigmoid(-beta * logits) * label_smoothing
-        return original_losses, chosen_rewards, rejected_rewards, (1/batch_size)* kl
+        return original_losses, chosen_rewards, rejected_rewards, (1/8*batch_size)* kl ,kl_divergence
 
 
 def preference_loss(policy_chosen_logps: torch.FloatTensor,
@@ -408,6 +424,7 @@ class BasicTrainer(object):
             # print(all_hidden_states[-1].shape) # torch.Size([32, 512, 2560])
 
             # print("all_logits sahpe",all_logits.shape) #([32, 512, 50304]) bs,seqlen,vocubulary_size
+            p_reference = all_logits.softmax(-1)
             all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
             # print("all_logps shape",all_logps.shape) # batchsize
             chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
@@ -426,7 +443,7 @@ class BasicTrainer(object):
                 # print("sentence_embeddings shape",sentence_embeddings.shape)
                 chosen_hidden = sentence_embeddings[:batch['chosen_input_ids'].shape[0]] #batchsize * 2560
                 rejected_hidden = sentence_embeddings[batch['rejected_input_ids'].shape[0]:]
-            return chosen_logps, rejected_logps, chosen_hidden.detach().float(), rejected_hidden.detach().float()
+            return chosen_logps, rejected_logps, chosen_hidden.detach().float(), rejected_hidden.detach().float(), p_reference
         else:
             concatenated_batch = concatenated_inputs(batch)
             # print("concatenated_batch",concatenated_batch)
@@ -450,6 +467,7 @@ class BasicTrainer(object):
         all_logits = output.logits.to(torch.float32)   
 
         all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
+        p_policy = all_logits.softmax(-1)
         # print("all_logps shape",all_logps.shape) # batchsize
         chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
         # print("batch['chosen_input_ids'].shape[0]",batch['chosen_input_ids'].shape[0]) # 16 batchsize/2
@@ -466,9 +484,9 @@ class BasicTrainer(object):
         # print("sentence_embeddings shape",sentence_embeddings.shape)
         chosen_hidden = sentence_embeddings[:batch['chosen_input_ids'].shape[0]].float() #batchsize * 2560
         rejected_hidden = sentence_embeddings[batch['rejected_input_ids'].shape[0]:].float()
-        print("chosen_hidden dtype",chosen_hidden.dtype)
+        # print("chosen_hidden dtype",chosen_hidden.dtype)
 
-        return chosen_logps, rejected_logps, chosen_hidden, rejected_hidden
+        return chosen_logps, rejected_logps, chosen_hidden, rejected_hidden, p_policy
 
 
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
@@ -477,10 +495,10 @@ class BasicTrainer(object):
         metrics = {}
         train_test = 'train' if train else 'eval'
         if loss_config.name in {'dpo', 'ipo'}:
-            policy_chosen_logps, policy_rejected_logps, policy_chosen_hidden, policy_rejected_hidden = self.concatenated_policy_forward(self.policy, batch)
+            policy_chosen_logps, policy_rejected_logps, policy_chosen_hidden, policy_rejected_hidden, all_policy_ps = self.concatenated_policy_forward(self.policy, batch)
 
             with torch.no_grad():
-                reference_chosen_logps, reference_rejected_logps, reference_chosen_hidden, reference_rejected_hidden = self.concatenated_forward(self.reference_model, batch, return_hidden=True)
+                reference_chosen_logps, reference_rejected_logps, reference_chosen_hidden, reference_rejected_hidden, all_reference_ps = self.concatenated_forward(self.reference_model, batch, return_hidden=True)
             if loss_config.name == 'dpo':
                 loss_kwargs = {'beta': loss_config.beta, 'alpha': loss_config.alpha, 'reference_free': loss_config.reference_free, 'label_smoothing': loss_config.label_smoothing, 'ipo': False}
             elif loss_config.name == 'ipo':
@@ -488,15 +506,19 @@ class BasicTrainer(object):
             else:
                 raise ValueError(f'unknown loss {loss_config.name}')
 
+            # print("batch['chosen_input_ids'] shape",batch['chosen_input_ids'].shape)
             # losses, chosen_rewards, rejected_rewards = preference_loss(
             #     policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, **loss_kwargs)
             if train_test == 'train':
-                losses, chosen_rewards, rejected_rewards, kl = bayes_preference_loss(
-                    batch, policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, reference_chosen_hidden, reference_rejected_hidden, policy_chosen_hidden, policy_rejected_hidden  ,self.all_additional_hps, train_process=True, **loss_kwargs)
+                losses, chosen_rewards, rejected_rewards, kl,new_addkl = bayes_preference_loss(self.rank,self.world_size,
+                    batch, policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, reference_chosen_hidden, reference_rejected_hidden, policy_chosen_hidden, policy_rejected_hidden  ,all_policy_ps,all_reference_ps,self.all_additional_hps, train_process=True, **loss_kwargs)
             else:
-                losses, chosen_rewards, rejected_rewards, kl = bayes_preference_loss(
-                    batch, policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, reference_chosen_hidden, reference_rejected_hidden , policy_chosen_hidden, policy_rejected_hidden ,self.all_additional_hps, train_process=False, **loss_kwargs)
-
+                losses, chosen_rewards, rejected_rewards, kl,new_addkl = bayes_preference_loss(self.rank,self.world_size,
+                    batch, policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, reference_chosen_hidden, reference_rejected_hidden , policy_chosen_hidden, policy_rejected_hidden ,all_policy_ps,all_reference_ps,self.all_additional_hps, train_process=False, **loss_kwargs)
+            # print("losses ",losses)
+            # print("losses shape",losses.shape)
+            # print("self.rank",self.rank)
+            # print("self.world_size",self.world_size)
 
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
@@ -504,12 +526,15 @@ class BasicTrainer(object):
             rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
             reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
             kl = all_gather_if_needed(kl, self.rank, self.world_size)
+            new_addkl = all_gather_if_needed(new_addkl, self.rank, self.world_size)
+            # print("chosen_rewards shape",chosen_rewards.shape) #chosen_rewards shape torch.Size([32])-》eval
 
             metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/kl'] = kl.cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/new_addkl'] = new_addkl.cpu().numpy().tolist()
             # metrics[f'kl_{train_test}/kl'] = kl.cpu().numpy().tolist()
 
             policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
@@ -525,6 +550,7 @@ class BasicTrainer(object):
         metrics[f'logps_{train_test}/chosen'] = policy_chosen_logps.cpu().numpy().tolist()
 
         all_devices_losses = all_gather_if_needed(losses.detach(), self.rank, self.world_size)
+        # print("all_devices_losses shape",all_devices_losses.shape)
         metrics[f'loss/{train_test}'] = all_devices_losses.cpu().numpy().tolist()
         # exit()
         return losses.mean(), metrics
